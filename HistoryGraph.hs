@@ -36,6 +36,7 @@ data Node a = Node
     , _stale :: Bool
     , _cachedValue :: Maybe a
     , _visited :: Bool -- for cycle detection
+    , _children :: [NodeId]
     }
 
 -- since we often add nodes, but 
