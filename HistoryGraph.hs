@@ -1,10 +1,19 @@
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TemplateHaskell, MultiWayIf #-}
 
 module HistoryGraph where
 
+import HistoryGraph.FunctionRegistry
+
+import Data.Map (Map)
+import qualified Data.Map as Map
+import Data.Maybe
 import Control.Lens
+import Control.Monad.State.Lazy
+import qualified Control.Error.Util as Er
+import Safe
 
 type NodeId = Int
+type HistoryError = String
 
 data Param = 
     Checkbox Bool
@@ -17,66 +26,128 @@ data Param =
 type Params = [Param]
 
 data ParamLabel = 
-    CheckboxName String
-    | TextName String
-    | ZNumName String
-    | RNumName String
-    | OptionsName String [String]
-    | ParentName String
+    CheckboxLabel String
+    | TextLabel String
+    | ZNumLabel String
+    | RNumLabel String
+    | OptionsLabel String [String]
+    | ParentLabel String
 
 type ParamLabels = [ParamLabel]
 
 -- TODO: named functions
 data Node a = Node 
-    { _compute :: Params -> a -> a
+    { _computationKey :: RegistryKey
     , _nodeDesc :: String
     , _savedParams :: [Params] -- TODO: removing frequents
-    , _currentParams :: Integer -- index of the above
+    , _currentParams :: Integer -- index into the above
     , _labels :: ParamLabels
-    , _stale :: Bool
     , _cachedValue :: Maybe a
-    , _visited :: Bool -- for cycle detection
+    , _visited :: Bool -- used for cycle detection
     , _children :: [NodeId]
     }
 
--- since we often add nodes, but 
--- rarely visit old nodes, the nodes
--- are in REVERSE id order, with new
--- nodes at the head of the list.
-type History a = ([Node a], NodeId)
--- the NodeId is the next id to give out
--- also the number of nodes in the list
+data History a = History 
+    { _nodes :: Map NodeId (Node a)
+    , _currentNodeId :: Maybe NodeId
+    , _nextUnusedNodeId :: NodeId
+    , _registry :: Registry (Params -> Either HistoryError a) 
+    }
 
 makeLenses ''Node
+makeLenses ''History
 
 -- TODO: cycle detector
 hasCycle :: History a -> Bool
 hasCycle h = False
 
-emptyHistory :: History a
-emptyHistory = ([],0)
+createHistory :: Registry (Params -> Either HistoryError a) -> History a
+createHistory registry = History
+    { _nodes = Map.empty
+    , _currentNodeId = Nothing
+    , _nextUnusedNodeId = 0
+    , _registry = registry
+    }
 
-addNode :: History a -> Node a -> History a
-addNode h n = h 
-    & _1 %~ (n:) 
-    & _2 %~ (+1)
+-- also sets the added node to be the current node
+addNode :: History a -> Node a -> Either HistoryError (History a)
+addNode h n = let 
+    h' = h 
+        & nodes %~ Map.insert (h^.nextUnusedNodeId) n
+        & currentNodeId .~ Just (h^.nextUnusedNodeId)
+        & nextUnusedNodeId %~ (+1)
+    in if hasCycle h' then Left "Can't add node; would cause cycle." else Right h'
 
-displayHistory :: History a -> [(String,NodeId)]
+-- don't set the current node to be the one just added
+addNodeInBackground :: History a -> Node a -> Either HistoryError (History a)
+addNodeInBackground h n = let 
+    h' = h 
+        & nodes %~ Map.insert (h^.nextUnusedNodeId) n
+        & nextUnusedNodeId %~ (+1)
+    in if hasCycle h' then Left "Can't add node; would cause cycle." else Right h'
+
+setCurrentNode :: History a -> NodeId -> History a
+setCurrentNode h id = h & currentNodeId .~ Just id
+
+displayHistory :: History a -> [(NodeId,String)]
 displayHistory h = let
-    indexes = [(h^._2),(h^._2)-1..]
-    names = h^.._1.traverse.nodeDesc
-    in zip names indexes
+    extractedNodes = Map.toList $ h^.nodes
+    in extractedNodes & traverse._2 %~ _nodeDesc
 
-viewNode :: NodeId -> (ParamLabels,Params,Int,Int)
---                                         |   ^current
---                                         ^ total
-viewNode nid = ([],[],0,0) -- TODO
+-- set a node to use another of its stored param sets
+switchParams :: NodeId -> Integer -> History a -> History a
+switchParams nodeId paramsIndex history = history
+    & nodes %~ Map.adjust (& currentParams .~ paramsIndex) nodeId
 
--- TODO:
-switchParams :: NodeId -> Int -> History a -> Either String (History a)
-switchParams _ _ = Right
+addParams :: NodeId -> Params -> History a -> History a
+addParams nodeId params history = history
+    & nodes %~ Map.adjust f nodeId
+    where
+        f :: Node a -> Node a
+        f n = n
+            & savedParams %~ (params :)
+            & currentParams .~ 0
+-- TODO: remove cached params in children !! ! ! ! ! ! ! ! ! 
 
--- TODO:
-addParams :: NodeId -> Params -> History a -> Either String (History a)
-addParams _ _ = Right
+{-
+getValue tries to compute the value of the current node.
+Along the way, it stores values in the _cachedValue of
+the nodes it visits. If something goes wrong, it
+will return a Left "error message". If the History contains
+a cycle, getValue will not crash or go into a loop, but 
+it will silently return an unpredictable value.
 
+If an error occurs, the returned history will be the same
+as the input history, discarding cached values created
+during this computation.
+-}
+getValue :: History a -> (Either HistoryError a, History a)
+getValue history = case runStateT getValue'h history of
+    Left message -> (Left message, history)
+    Right (x,history') -> (Right x, history')
+
+getValue'h :: StateT (History a) (Either HistoryError) a
+getValue'h = do
+    h <- get
+    nodeId <- lift $ Er.note "No node is selected." (h^.currentNodeId)
+    node <- lift $ Er.note "Invalid current node id." (Map.lookup nodeId (h^.nodes))
+    let paramIdx = node^.currentParams
+    let maybeParams = headMay $ drop (fromInteger paramIdx) $ node^.savedParams
+    params <- lift $ Er.note ("Bad params index for node "++show nodeId) maybeParams
+    when (not $ paramsAreValid params (node^.labels)) $ 
+        lift $ Left $ "Corrupted params for node "++show nodeId
+    -- TODO: check cached value (earlier?), compute parents, do computation
+    return undefined
+
+paramsAreValid :: Params -> ParamLabels -> Bool
+paramsAreValid ps plabels = 
+    length ps == length plabels && all sameParamConstructor (zip ps plabels)
+
+sameParamConstructor :: (Param,ParamLabel) -> Bool
+sameParamConstructor (Checkbox _, CheckboxLabel _) = True
+sameParamConstructor (Text _, TextLabel _) = True
+sameParamConstructor (ZNum _, ZNumLabel _) = True
+sameParamConstructor (RNum _, RNumLabel _) = True
+sameParamConstructor (Options _, OptionsLabel _ _) = True
+sameParamConstructor (Parent _, ParentLabel _) = True
+sameParamConstructor _ = False
