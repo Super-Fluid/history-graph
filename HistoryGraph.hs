@@ -9,6 +9,7 @@ import qualified Data.Map as Map
 import Data.Maybe
 import Control.Lens
 import Control.Monad.State.Lazy
+import Control.Monad
 import qualified Control.Error.Util as Er
 import Safe
 
@@ -35,6 +36,16 @@ data ParamLabel =
 
 type ParamLabels = [ParamLabel]
 
+data ParamEval a = 
+    CheckboxEval Bool
+    | TextEval String
+    | ZNumEval Integer
+    | RNumEval Double
+    | OptionsEval Integer
+    | ParentEval a
+
+type ParamEvals a = [ParamEval a]
+
 -- TODO: named functions
 data Node a = Node 
     { _computationKey :: RegistryKey
@@ -51,7 +62,7 @@ data History a = History
     { _nodes :: Map NodeId (Node a)
     , _currentNodeId :: Maybe NodeId
     , _nextUnusedNodeId :: NodeId
-    , _registry :: Registry (Params -> Either HistoryError a) 
+    , _registry :: Registry (ParamEvals a -> Either HistoryError a) 
     }
 
 makeLenses ''Node
@@ -61,7 +72,7 @@ makeLenses ''History
 hasCycle :: History a -> Bool
 hasCycle h = False
 
-createHistory :: Registry (Params -> Either HistoryError a) -> History a
+createHistory :: Registry (ParamEvals a -> Either HistoryError a) -> History a
 createHistory registry = History
     { _nodes = Map.empty
     , _currentNodeId = Nothing
@@ -98,6 +109,7 @@ displayHistory h = let
 switchParams :: NodeId -> Integer -> History a -> History a
 switchParams nodeId paramsIndex history = history
     & nodes %~ Map.adjust (& currentParams .~ paramsIndex) nodeId
+-- TODO: erase cached value
 
 addParams :: NodeId -> Params -> History a -> History a
 addParams nodeId params history = history
@@ -136,8 +148,29 @@ getValue'h = do
     params <- lift $ Er.note ("Bad params index for node "++show nodeId) maybeParams
     when (not $ paramsAreValid params (node^.labels)) $ 
         lift $ Left $ "Corrupted params for node "++show nodeId
-    -- TODO: check cached value (earlier?), compute parents, do computation
-    return undefined
+    nodeFunction <- lift $ Er.note ("Bad function key for node "++show nodeId) $
+        lookupByKey (h^.registry) (node^.computationKey)
+    paramEvals <- mapM evalParam params
+    computedVal <- lift $ nodeFunction paramEvals
+    let cached = node^.cachedValue
+    case cached of 
+        (Just x) -> lift $ Right x
+        Nothing -> do
+            let node' = node & cachedValue .~ Just computedVal
+            nodes %= Map.update (const $ Just node') nodeId
+            return computedVal
+
+evalParam :: Param -> StateT (History a) (Either HistoryError) (ParamEval a)
+evalParam (Checkbox b) = lift $ Right $ CheckboxEval b
+evalParam (Text s) = lift $ Right $ TextEval s
+evalParam (ZNum n) = lift $ Right $ ZNumEval n
+evalParam (RNum x) = lift $ Right $ RNumEval x
+evalParam (Options i) = lift $ Right $ OptionsEval i
+evalParam (Parent nodeId) = do
+    currentNodeId .= Just nodeId
+    val <- getValue'h
+    return $ ParentEval val
+
 
 paramsAreValid :: Params -> ParamLabels -> Bool
 paramsAreValid ps plabels = 
