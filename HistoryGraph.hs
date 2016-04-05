@@ -20,6 +20,7 @@ data Param =
     Checkbox Bool
     | Text String
     | ZNum Integer
+    | QNum Rational
     | RNum Double
     | Options Integer
     | Parent NodeId
@@ -30,6 +31,7 @@ data ParamLabel =
     CheckboxLabel String
     | TextLabel String
     | ZNumLabel String
+    | QNumLabel String
     | RNumLabel String
     | OptionsLabel String [String]
     | ParentLabel String
@@ -40,6 +42,7 @@ data ParamEval a =
     CheckboxEval Bool
     | TextEval String
     | ZNumEval Integer
+    | QNumEval Rational
     | RNumEval Double
     | OptionsEval Integer
     | ParentEval a
@@ -164,6 +167,7 @@ evalParam :: Param -> StateT (History a) (Either HistoryError) (ParamEval a)
 evalParam (Checkbox b) = lift $ Right $ CheckboxEval b
 evalParam (Text s) = lift $ Right $ TextEval s
 evalParam (ZNum n) = lift $ Right $ ZNumEval n
+evalParam (QNum x) = lift $ Right $ QNumEval x
 evalParam (RNum x) = lift $ Right $ RNumEval x
 evalParam (Options i) = lift $ Right $ OptionsEval i
 evalParam (Parent nodeId) = do
@@ -180,6 +184,7 @@ sameParamConstructor :: (Param,ParamLabel) -> Bool
 sameParamConstructor (Checkbox _, CheckboxLabel _) = True
 sameParamConstructor (Text _, TextLabel _) = True
 sameParamConstructor (ZNum _, ZNumLabel _) = True
+sameParamConstructor (QNum _, QNumLabel _) = True
 sameParamConstructor (RNum _, RNumLabel _) = True
 sameParamConstructor (Options _, OptionsLabel _ _) = True
 sameParamConstructor (Parent _, ParentLabel _) = True
