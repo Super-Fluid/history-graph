@@ -58,7 +58,7 @@ data Node a = Node
     , _labels :: ParamLabels
     , _cachedValue :: Maybe a
     , _visited :: Bool -- used for cycle detection
-    , _children :: [NodeId]
+    , _childNodes :: [NodeId]
     }
 
 data History a = History 
@@ -109,20 +109,39 @@ displayHistory h = let
     in extractedNodes & traverse._2 %~ _nodeDesc
 
 -- set a node to use another of its stored param sets
-switchParams :: NodeId -> Integer -> History a -> History a
+switchParams :: NodeId -> Integer -> History a -> Either HistoryError (History a)
 switchParams nodeId paramsIndex history = history
     & nodes %~ Map.adjust (& currentParams .~ paramsIndex) nodeId
--- TODO: erase cached value
+    & runStateT removeCachedValues
+    & fmap snd
 
-addParams :: NodeId -> Params -> History a -> History a
+addParams :: NodeId -> Params -> History a -> Either HistoryError (History a)
 addParams nodeId params history = history
     & nodes %~ Map.adjust f nodeId
+    & runStateT removeCachedValues
+    & fmap snd
     where
         f :: Node a -> Node a
         f n = n
             & savedParams %~ (params :)
             & currentParams .~ 0
--- TODO: remove cached params in children !! ! ! ! ! ! ! ! ! 
+
+{-
+Remove the cached values in this node and its children.
+Will loop infinitely if there's a cycle!
+This implementation may visit nodes multiple times...
+-}
+removeCachedValues :: StateT (History a) (Either HistoryError) ()
+removeCachedValues = do
+    h <- get
+    nodeId <- lift $ Er.note "No node is selected." (h^.currentNodeId)
+    node <- lift $ Er.note "Invalid current node id." (Map.lookup nodeId (h^.nodes))
+    let paramIdx = node^.currentParams
+    let maybeParams = headMay $ drop (fromInteger paramIdx) $ node^.savedParams
+    let node' = node & cachedValue .~ Nothing
+    nodes %= Map.update (const $ Just node') nodeId
+    mapM (\n -> do currentNodeId .= Just n; removeCachedValues) (node^.childNodes)
+    return ()
 
 {-
 getValue tries to compute the value of the current node.
@@ -161,6 +180,7 @@ getValue'h = do
         Nothing -> do
             let node' = node & cachedValue .~ Just computedVal
             nodes %= Map.update (const $ Just node') nodeId
+            removeCachedValues
             return computedVal
 
 evalParam :: Param -> StateT (History a) (Either HistoryError) (ParamEval a)
@@ -174,7 +194,6 @@ evalParam (Parent nodeId) = do
     currentNodeId .= Just nodeId
     val <- getValue'h
     return $ ParentEval val
-
 
 paramsAreValid :: Params -> ParamLabels -> Bool
 paramsAreValid ps plabels = 
