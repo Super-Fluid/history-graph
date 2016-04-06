@@ -199,3 +199,4 @@ sameParamConstructor (RNum _, RNumLabel _) = True
 sameParamConstructor (Options _, OptionsLabel _ _) = True
 sameParamConstructor (Parent _, ParentLabel _) = True
 sameParamConstructor _ = False
+
