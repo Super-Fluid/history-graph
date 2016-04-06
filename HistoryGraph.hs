@@ -1,4 +1,5 @@
 {-# LANGUAGE TemplateHaskell, MultiWayIf #-}
+{-# LANGUAGE LambdaCase #-}
 
 module HistoryGraph where
 
@@ -10,6 +11,7 @@ import Data.Maybe
 import Control.Lens
 import Control.Monad.State.Lazy
 import Control.Monad
+import Control.Monad.Extra (concatMapM)
 import qualified Control.Error.Util as Er
 import Safe
 
@@ -57,7 +59,7 @@ data Node a = Node
     , _currentParams :: Integer -- index into the above
     , _labels :: ParamLabels
     , _cachedValue :: Maybe a
-    , _visited :: Bool -- used for cycle detection
+    , _ancestors :: [NodeId] -- used for cycle detection
     , _childNodes :: [NodeId]
     }
 
@@ -71,9 +73,45 @@ data History a = History
 makeLenses ''Node
 makeLenses ''History
 
--- TODO: cycle detector
+-- Note: a corrupted graph gives False
 hasCycle :: History a -> Bool
-hasCycle h = False
+hasCycle history = isNothing $ runStateT hasCycle'H history
+
+hasCycle'H :: StateT (History a) (Maybe) ()
+hasCycle'H = do
+    nodes %= Map.map (ancestors .~ [])
+    h <- get
+    let nodeIds = Map.keys (h^.nodes)
+    mapM getAncestors nodeIds -- if any failure, stop and return Nothing
+    return () -- ie "lift $ Just ()"
+    
+getAncestors :: NodeId -> StateT (History a) (Maybe) [NodeId]
+getAncestors nodeId = do
+    h <- get
+    let nodeMay = Map.lookup nodeId (h^.nodes)
+    case nodeMay of
+        Nothing -> return [] -- graph is corrupted but no a cycle
+        Just node -> do
+            let paramIdx = node^.currentParams
+            let paramsMay = headMay $ drop (fromInteger paramIdx) $ node^.savedParams
+            case paramsMay of
+                Nothing -> return []
+                Just params -> do
+                    let parents = getParents params
+                    if nodeId `elem` parents
+                        then lift Nothing -- cycle
+                        else do
+                            nodes %= Map.update (\n -> n & ancestors .~ parents & Just) nodeId
+                            parentAncestors <- concatMapM getAncestors parents
+                            if nodeId `elem` parentAncestors
+                                then lift Nothing -- cycle
+                                else do
+                                    let allAncestors = parents ++ parentAncestors
+                                    nodes %= Map.update (\n -> n & ancestors .~ allAncestors & Just) nodeId
+                                    return allAncestors
+
+getParents :: Params -> [NodeId]
+getParents params = mapMaybe (\case (Parent nodeId) -> Just nodeId; _ -> Nothing) params
 
 createHistory :: Registry (ParamEvals a -> Either HistoryError a) -> History a
 createHistory registry = History
@@ -110,16 +148,24 @@ displayHistory h = let
 
 -- set a node to use another of its stored param sets
 switchParams :: NodeId -> Integer -> History a -> Either HistoryError (History a)
-switchParams nodeId paramsIndex history = history
-    & nodes %~ Map.adjust (& currentParams .~ paramsIndex) nodeId
-    & runStateT removeCachedValues
-    & fmap snd
+switchParams nodeId paramsIndex history = let
+    history' = history
+        & nodes %~ Map.adjust (& currentParams .~ paramsIndex) nodeId
+    in if hasCycle history' 
+        then Left "Can't switch params; would create cycle." 
+        else history'
+            & runStateT removeCachedValues
+            & fmap snd
 
 addParams :: NodeId -> Params -> History a -> Either HistoryError (History a)
-addParams nodeId params history = history
-    & nodes %~ Map.adjust f nodeId
-    & runStateT removeCachedValues
-    & fmap snd
+addParams nodeId params history = let
+    history' = history
+        & nodes %~ Map.adjust f nodeId
+    in if hasCycle history' 
+        then Left "Can't add params; would create cycle." 
+        else history'
+            & runStateT removeCachedValues
+            & fmap snd
     where
         f :: Node a -> Node a
         f n = n
@@ -137,7 +183,7 @@ removeCachedValues = do
     nodeId <- lift $ Er.note "No node is selected." (h^.currentNodeId)
     node <- lift $ Er.note "Invalid current node id." (Map.lookup nodeId (h^.nodes))
     let paramIdx = node^.currentParams
-    let maybeParams = headMay $ drop (fromInteger paramIdx) $ node^.savedParams
+--    let maybeParams = headMay $ drop (fromInteger paramIdx) $ node^.savedParams
     let node' = node & cachedValue .~ Nothing
     nodes %= Map.update (const $ Just node') nodeId
     mapM (\n -> do currentNodeId .= Just n; removeCachedValues) (node^.childNodes)
