@@ -4,6 +4,7 @@
 module HistoryGraph where
 
 import HistoryGraph.FunctionRegistry
+import HistoryGraph.Types
 
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -14,64 +15,6 @@ import Control.Monad
 import Control.Monad.Extra (concatMapM)
 import qualified Control.Error.Util as Er
 import Safe
-
-type NodeId = Int
-type HistoryError = String
-
-data Param = 
-    Checkbox Bool
-    | Text String
-    | ZNum Integer
-    | QNum Rational
-    | RNum Double
-    | Options Integer
-    | Parent NodeId
-
-type Params = [Param]
-
-data ParamLabel = 
-    CheckboxLabel String
-    | TextLabel String
-    | ZNumLabel String
-    | QNumLabel String
-    | RNumLabel String
-    | OptionsLabel String [String]
-    | ParentLabel String
-
-type ParamLabels = [ParamLabel]
-
-data ParamEval a = 
-    CheckboxEval Bool
-    | TextEval String
-    | ZNumEval Integer
-    | QNumEval Rational
-    | RNumEval Double
-    | OptionsEval Integer
-    | ParentEval a
-
-type ParamEvals a = [ParamEval a]
-
--- TODO: named functions
-data Node a = Node 
-    { _computationKey :: RegistryKey
-    , _nodeDesc :: String
-    , _savedParams :: [Params] -- TODO: removing frequents
-    , _currentParams :: Integer -- index into the above
-    , _labels :: ParamLabels
-    , _cachedValue :: Maybe a
-    , _ancestors :: [NodeId] -- used for cycle detection
-    , _childNodes :: [NodeId]
-    }
-
-data History a = History 
-    { _nodes :: Map NodeId (Node a)
-    , _currentNodeId :: Maybe NodeId
-    , _nextUnusedNodeId :: NodeId
-    , _registry :: Registry (ParamEvals a -> Either HistoryError a) 
-    }
-
-makeLenses ''Node
-makeLenses ''History
 
 -- Note: a corrupted graph gives False
 hasCycle :: History a -> Bool
@@ -113,7 +56,7 @@ getAncestors nodeId = do
 getParents :: Params -> [NodeId]
 getParents params = mapMaybe (\case (Parent nodeId) -> Just nodeId; _ -> Nothing) params
 
-createHistory :: Registry (ParamEvals a -> Either HistoryError a) -> History a
+createHistory :: Registry a -> History a
 createHistory registry = History
     { _nodes = Map.empty
     , _currentNodeId = Nothing
@@ -144,7 +87,8 @@ setCurrentNode h id = h & currentNodeId .~ Just id
 displayHistory :: History a -> [(NodeId,String)]
 displayHistory h = let
     extractedNodes = Map.toList $ h^.nodes
-    in extractedNodes & traverse._2 %~ _nodeDesc
+    in extractedNodes & traverse._2 %~ 
+        (fromMaybe "lookup failed" . fmap _name . lookupByKey (h^.registry) . _computationKey)
 
 -- set a node to use another of its stored param sets
 switchParams :: NodeId -> Integer -> History a -> Either HistoryError (History a)
@@ -214,10 +158,11 @@ getValue'h = do
     let paramIdx = node^.currentParams
     let maybeParams = headMay $ drop (fromInteger paramIdx) $ node^.savedParams
     params <- lift $ Er.note ("Bad params index for node "++show nodeId) maybeParams
-    when (not $ paramsAreValid params (node^.labels)) $ 
+    let paramLabels = node & _computationKey & lookupByKey (h^.registry) & fmap _labels & fromMaybe []
+    when (not $ paramsAreValid params paramLabels) $ 
         lift $ Left $ "Corrupted params for node "++show nodeId
     nodeFunction <- lift $ Er.note ("Bad function key for node "++show nodeId) $
-        lookupByKey (h^.registry) (node^.computationKey)
+        fmap _function $ lookupByKey (h^.registry) (node^.computationKey)
     paramEvals <- mapM evalParam params
     computedVal <- lift $ nodeFunction paramEvals
     let cached = node^.cachedValue
